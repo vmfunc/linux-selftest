@@ -13,7 +13,7 @@ sudo emerge sys-kernel/linux-headers
 # Build
 make
 ```
- remove the module:
+
 ## Installation
 
 ```bash

@@ -28,6 +28,13 @@ MODULE_DESCRIPTION("Linux Kernel Self-Test Module");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("1.0");
 
+static struct kprobe kp = {
+    .symbol_name = "kallsyms_lookup_name"
+};
+
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+static kallsyms_lookup_name_t kallsyms_lookup_name_func;
+
 struct build_test_info {
     const char *component;
     const char *description;
@@ -151,21 +158,17 @@ static bool test_fortify_source(void)
 
 static bool verify_read_only_text_section(void)
 {
-    unsigned long start, end;
     unsigned char *ptr;
     bool ret = true;
+    unsigned long addr;
 
-    start = (unsigned long)_stext;
-    end = (unsigned long)_etext;
+    addr = (unsigned long)verify_read_only_text_section;
+    ptr = (unsigned char *)addr;
 
-    /* write to a random location in text section */
-    ptr = (unsigned char *)start + PAGE_SIZE;
-    if (ptr < (unsigned char *)end) {
-        unsigned char test_val = 0x42;
-        if (copy_to_kernel_nofault(ptr, &test_val, 1) == 0) {
-            pr_err("selftest: Text section is writable!\n");
-            ret = false;
-        }
+    unsigned char test_val = 0x42;
+    if (copy_to_kernel_nofault(ptr, &test_val, 1) == 0) {
+        pr_err("selftest: Text section is writable!\n");
+        ret = false;
     }
 
     return ret;
@@ -176,13 +179,18 @@ static bool test_kernel_symbol_protection(void)
     unsigned long addr;
     bool protected = true;
 
-    addr = kallsyms_lookup_name("sys_call_table");
+    if (!kallsyms_lookup_name_func) {
+        pr_err("selftest: kallsyms_lookup_name not available\n");
+        return false;
+    }
+
+    addr = kallsyms_lookup_name_func("sys_call_table");
     if (addr != 0) {
         pr_err("selftest: sys_call_table symbol is exposed!\n");
         protected = false;
     }
 
-    addr = kallsyms_lookup_name("do_init_module");
+    addr = kallsyms_lookup_name_func("do_init_module");
     if (addr != 0) {
         pr_err("selftest: do_init_module symbol is exposed!\n");
         protected = false;
@@ -279,6 +287,10 @@ static bool test_kernel_image_integrity(void)
     char *hash_result;
     int err;
     bool ret = false;
+    unsigned long addr;
+
+    /* Use an already defined function's address */
+    addr = (unsigned long)test_basic_alloc;
 
     /* SHA-256 transform */
     tfm = crypto_alloc_shash("sha256", 0, 0);
@@ -302,14 +314,12 @@ static bool test_kernel_image_integrity(void)
 
     desc->tfm = tfm;
 
-    /* kernel text section */
     err = crypto_shash_init(desc);
     if (err) {
         goto out;
     }
 
-    err = crypto_shash_update(desc, (const u8 *)_stext, 
-                            (unsigned long)_etext - (unsigned long)_stext);
+    err = crypto_shash_update(desc, (const u8 *)addr, PAGE_SIZE);
     if (err) {
         goto out;
     }
@@ -319,7 +329,6 @@ static bool test_kernel_image_integrity(void)
         goto out;
     }
 
-    /* TODO: compare against known good hash */
     ret = true;
 
     pr_info("selftest: Kernel text section SHA-256:");
@@ -489,6 +498,7 @@ static const struct file_operations security_test_fops = {
 
 static int __init selftest_init(void)
 {
+    int ret;
     int i, failed = 0;
     const int nr_tests = ARRAY_SIZE(build_tests);
     
@@ -530,6 +540,14 @@ static int __init selftest_init(void)
     }
 
     pr_info("selftest: Starting kernel self-tests...\n");
+
+    ret = register_kprobe(&kp);
+    if (ret < 0) {
+        pr_err("selftest: kprobe registration failed\n");
+        return ret;
+    }
+    kallsyms_lookup_name_func = (kallsyms_lookup_name_t)kp.addr;
+    unregister_kprobe(&kp);
 
     for (i = 0; i < nr_tests; i++) {
         const struct build_test_info *test = &build_tests[i];
